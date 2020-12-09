@@ -3,21 +3,18 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
+using UnityEditor;
 using UnityEngine;
 
 namespace Coherence
 {
+    [ExecuteAlways]
     public class ObjectController : MonoBehaviour
     {
         /// <summary>
         /// The matching BlenderObject to this entity
         /// </summary>
         public InteropSceneObject Data { get; set; }
-
-        /// <summary>
-        /// Number of viewports that can see this object
-        /// </summary>
-        public int ViewportCount { get; set; }
 
         internal int[] triangles;
         internal Vector3[] vertices;
@@ -29,23 +26,18 @@ namespace Coherence
 
         bool isDirty;
 
-        public void LateUpdate()
+        public void Sync()
         {
-            // After the Update() cycle where we potentially replace regions of 
-            // our mesh data, check if we need to copy this data back into Unity.
-            // This lets us avoid the copy op multiple times in the same Update() 
-            // in case the Sync manager reads multiple chunks at once.
             if (isDirty)
-            {   
+            {
                 isDirty = false;
                 UpdateMesh();
             }
-
         }
 
         /// <summary>
-        /// Add a Unity mesh representation of this object. 
-        /// We expect it to be filled through data chunks coming from Blender. 
+        /// Add a Unity mesh representation of this object.
+        /// We expect it to be filled through data chunks coming from Blender.
         /// </summary>
         void AddMesh(string name)
         {
@@ -55,7 +47,7 @@ namespace Coherence
             mesh.MarkDynamic();
 
             meshFilter = GetComponent<MeshFilter>();
-            if (meshFilter == null) 
+            if (meshFilter == null)
             {
                 meshFilter = gameObject.AddComponent<MeshFilter>();
             }
@@ -76,16 +68,16 @@ namespace Coherence
 
         internal void UpdateFromInterop(InteropSceneObject obj)
         {
-            // Blender is z-up - swap z/y everywhere 
+            // Blender is z-up - swap z/y everywhere
             // TODO: But they could also change the up axis manually...
             InteropMatrix4x4 t = obj.transform;
             transform.position = new Vector3(t.m03, t.m23, t.m13);
-        
+
             Vector3 forward;
             forward.x = t.m02;
             forward.y = t.m22;
             forward.z = t.m12;
- 
+
             Vector3 up;
             up.x = t.m01;
             up.y = t.m21;
@@ -100,12 +92,12 @@ namespace Coherence
                 new Vector4(t.m01, t.m11, t.m31, t.m21).magnitude,
                 new Vector4(t.m02, t.m12, t.m32, t.m22).magnitude
             );
-        
+
             if (obj.type == SceneObjectType.Mesh && mesh == null)
             {
-                AddMesh($"Blender Mesh #{obj.id}");
+                AddMesh($"Blender Mesh `{obj.name}`");
             }
-        
+
             // Material name change
             if (Data.material != obj.material)
             {
@@ -117,6 +109,7 @@ namespace Coherence
 
         void SetMaterial(string name)
         {
+            // TODO: Smarter path lookup and mapping
             string path = $"Materials/{name}";
 
             var material = Resources.Load<Material>(path);
@@ -209,13 +202,13 @@ namespace Coherence
             // TODO: Figure out if we've filled out these arrays.
             // Each OnUpdate* would probably let us fill in a min/max
             // range value (assuming no gaps between ranges...).
-            // Alternatively - screw it. Who cares if there's a bunch 
+            // Alternatively - screw it. Who cares if there's a bunch
             // of zeroed data while waiting for more batches.
 
             // Upload to Unity's managed mesh data
             mesh.Clear();
             try
-            { 
+            {
                 mesh.vertices = vertices;
                 mesh.triangles = triangles;
             }
@@ -223,18 +216,18 @@ namespace Coherence
             {
                 // Removing subd from blender errors out on 226 for:
                 // Failed setting triangles. Some indices are referencing out of bounds vertices. IndexCount: 188928, VertexCount: 507
-            
+
                 // Probably due to the ordering of getting mesh data. We get updated verts first (with new count smaller)
-                // and then use the old indices list until we get the updated indices immediately after. 
+                // and then use the old indices list until we get the updated indices immediately after.
                 // TODO: We might need a footer message for "yes here's everything, please rebuild the mesh now"
-            
+
                 // TODO: Seems like this is uncatchable. Raised from UnityEngine.Mesh:set_triangles(Int32[])
                 Debug.LogWarning($"Could not copy Blender mesh data: {e}");
             }
 
             // We check for normal length here because if a vertex array
             // update comes in and we rebuild the mesh *before* a followup
-            // normals array comes in - they could differ in size if the 
+            // normals array comes in - they could differ in size if the
             // mesh has vertices added/removed from within Blender.
             if (normals != null && normals.Length == vertices.Length)
             {
@@ -243,7 +236,13 @@ namespace Coherence
 
             // uv#, colors, etc.
 
-            mesh.MarkModified();
+            // mesh.MarkModified();
+
+            // In editor mode - if the editor doesn't have focus then the mesh won't be updated.
+            // So we force upload to the GPU once we have everything ready. We also maintain
+            // local copies of mesh data to be updated by Blender whenever new data comes in.
+            // (so we don't free up, say, UVs, and then not have that buffer when re-applying from Blender)
+            mesh.UploadMeshData(false);
         }
 
         internal void OnUpdateVertexRange(int index, int count)

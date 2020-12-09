@@ -9,7 +9,7 @@ from bgl import *
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector, Matrix, Quaternion
 from math import cos
-from copy import copy 
+from copy import copy
 from weakref import WeakValueDictionary
 import threading
 
@@ -40,88 +40,86 @@ from .utils import (
     error,
     is_supported_object,
     get_object_uid,
-    get_material_unity_name
+    get_material_unity_name,
+    get_string_buffer
 )
 
-from .interop import * 
+from .interop import *
 
-def bridge_driver():
-    """Retrieve the active driver singleton
-    
-    Returns:
-        BridgeDriver
-    """
-    if 'FOO' not in bpy.app.driver_namespace:
-        bpy.app.driver_namespace['FOO'] = BridgeDriver()
-
-    return bpy.app.driver_namespace['FOO']
-    
 class BridgeDriver:
     """Respond to scene object changes and handle messaging through the Unity bridge"""
 
-    object_ids = set()
-    active: bool = False
+    running = False
     lib = None
-    version = None
+    connection_name: str = None
+    blender_version: str = None
 
     # Mapping between viewport IDs and RenderEngine instances.
     # Weakref is used so that we don't hold onto RenderEngine references
     # since Blender uses __del__ to release them after use
     viewports = WeakValueDictionary()
 
+    # Tracked object names already synced to the DLL
+    objects = set()
+
     def __init__(self):
-        # TODO: Better path lookup.
-        path = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.path.sep + 'Bridge.dll'
+        # TODO: Better path lookup. I'm using a junction point in Blender
+        # to reference the DLL during development - so this needs to be hardcoded
+        # since __file__ shows the virtual path
+
+        # path = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.path.sep + 'Bridge.dll'
+        path = 'D:\\Unity Projects\\Coherence\\Blender~\\LibCoherence\\bin\\Debug\\LibCoherence.dll'
+
         log('Loading DLL from {}'.format(path))
 
         self.lib = cdll.LoadLibrary(path)
-        
+
         # Typehint all the API calls we actually need to typehint
-        self.lib.Start.restype = c_int
+        self.lib.Connect.restype = c_int
+        self.lib.Disconnect.restype = c_int
+        self.lib.Clear.restype = c_int
         self.lib.SetViewportCamera.argtypes = (c_int, InteropCamera)
-        self.lib.CopyVertices.argtypes = (c_int, c_void_p, c_uint, c_void_p, c_uint)
-        self.lib.CopyLoopTriangles.argtypes = (c_int, c_void_p, c_uint)
+        self.lib.CopyVertices.argtypes = (c_void_p, c_void_p, c_uint, c_void_p, c_uint)
+        self.lib.CopyLoopTriangles.argtypes = (c_void_p, c_void_p, c_uint)
         self.lib.GetRenderTexture.argtypes = (c_uint, )
         self.lib.GetRenderTexture.restype = RenderTextureData
-        
+
         self.lib.ReleaseRenderTextureLock.argtypes = (c_uint, )
         self.lib.ReleaseRenderTextureLock.restype = c_int
 
         # bpy.types.SpaceView3D.draw_handler_add(post_view_draw, (), 'WINDOW', 'POST_PIXEL')
 
-        self.version = self.lib.Version()
 
     def __del__(self):
         debug('__del__ on bridge')
 
         # bpy.types.SpaceView3D.draw_handler_remove(post_view_draw, 'WINDOW')
 
-    def setup(self, scene):
-        """
+    def start(self):
+        """Start trying to connect to Unity
+
         Parameters:
             scene (bpy.types.Scene)
         """
         log('Starting the DCC')
         self.object_ids = set()
 
-        if self.lib.Start() < 0:
-            error('Could not start bridge: Internal error')
-            return 
-
-        self.active = True
+        self.connection_name = create_string_buffer("Coherence".encode())
+        self.blender_version = create_string_buffer(bpy.app.version_string.encode())
+        self.running = True
 
         bpy.app.handlers.depsgraph_update_post.append(self.on_depsgraph_update)
         bpy.app.timers.register(self.on_tick)
-        
+
         # Sync the current scene state into the bridge
         self.sync_tracked_objects(
-            bpy.context.scene, 
+            bpy.context.scene,
             bpy.context.evaluated_depsgraph_get()
         )
 
     # def add_all_from_scene(self, scene):
     #     """Add all objects in the scene to the bridge
-        
+
     #     Parameters:
     #         scene (bpy.types.Scene)
     #     """
@@ -132,25 +130,30 @@ class BridgeDriver:
     #             self.on_add_object(obj)
     #             self.object_ids.add(get_object_uid(obj))
 
-    def teardown(self):
+    def stop(self):
+        """Disconnect from Unity and cleanup sycned objects"""
         log('DCC teardown')
-        self.lib.Shutdown()
+        self.lib.Disconnect()
+        self.lib.Clear()
 
-        # Turning off `active` will also destroy the `on_tick` timer.
-        self.active = False
-        
+        # Turning off `running` will also destroy the `on_tick` timer.
+        self.running = False
+
         if self.on_depsgraph_update in depsgraph_update_post:
             depsgraph_update_post.remove(self.on_depsgraph_update)
+
+        # Untrack everything in the scene - we'll have to re-track it all on start() again.
+        self.object_ids = set()
 
     def free_lib(self): # UNUSED
         pass
         # # Windows-specific handling for freeing the DLL.
-        # # See: https://stackoverflow.com/questions/359498/how-can-i-unload-a-dll-using-ctypes-in-python  
+        # # See: https://stackoverflow.com/questions/359498/how-can-i-unload-a-dll-using-ctypes-in-python
         # handle = self.lib._handle
         # del self.lib
         # self.lib = None
 
-        # kernel32 = WinDLL('kernel32', use_last_error=True)    
+        # kernel32 = WinDLL('kernel32', use_last_error=True)
         # kernel32.FreeLibrary.argtypes = [wintypes.HMODULE]
         # kernel32.FreeLibrary(handle)
 
@@ -158,7 +161,7 @@ class BridgeDriver:
         """Add a RenderEngine instance as a tracked viewport
 
         Parameters:
-            render_engine (FooRenderEngine)
+            render_engine (CoherenceRenderEngine)
         """
         log('Create Viewport {} from {}'.format(
             render_engine.viewport_id,
@@ -185,74 +188,118 @@ class BridgeDriver:
         Returns:
             bool
         """
-        # TODO: ask bridge
         return self.lib.IsConnectedToUnity()
 
-    def is_ready(self) -> bool:
-        """Is the driver ready to start accepting connections
-        
+    def is_running(self) -> bool:
+        """Is the driver actively trying to / is connected to Unity
+
         Returns:
             bool
         """
-        return self.active 
+        return self.running
 
     def on_tick(self):
-        """Timer registered through bpy.app.timers to push/pull messages through the bridge"""
-        if not self.active:
+        """
+            Timer registered through bpy.app.timers to handle
+            connecting/reconnecting to Unity and processing messages
+
+        Returns:
+            float for next time to run the timer, or None to destroy it
+        """
+        if not self.running:
             log('Deactivating on_tick timer')
             return None
 
-        # Push/pull shared message channels with Unity
-        self.lib.Update()
-        self.lib.ConsumeRenderTextures()
+        # While actively connected to Unity, send typical IO,
+        # get viewport renders, and run as fast as possible
+        if self.lib.IsConnectedToUnity():
+            self.lib.Update()
+            self.lib.ConsumeRenderTextures()
 
-        # Tag all active render engines for a redraw
+            self.tag_redraw_viewports()
+
+            # During an update we lost connection.
+            if not self.lib.IsConnectedToUnity():
+                self.on_disconnected_from_unity()
+
+            #return 0.0001
+            #return 0.016 # 60 FPS update rate
+            return 0.008 # 120 FPS
+
+        # Attempt to connect to shared memory if not already
+        if not self.lib.IsConnectedToSharedMemory():
+            response = self.lib.Connect(self.connection_name, self.blender_version)
+            if response == 1:
+                self.on_connected_to_shared_memory()
+            elif response == -1:
+                print('UNKNOWN ERROR WOO!')
+                exit()
+            # else the space doesn't exist.
+
+        # Poll for updates from Unity until we get one.
+        self.lib.Update()
+
+        if self.lib.IsConnectedToUnity():
+            self.on_connected_to_unity()
+
+        return 0.05
+
+    def on_connected_to_unity(self):
+        debug('on_connected_to_unity')
+        pass
+
+    def on_connected_to_shared_memory(self):
+        debug('on_connected_to_shared_memory')
+        pass
+
+    def on_disconnected_from_unity(self):
+        debug('on_disconnected_from_unity')
+        pass
+
+    def tag_redraw_viewports(self):
+        """Tag all active render engines for a redraw"""
         for v in self.viewports.items():
             try:
                 v[1].on_update()
             except e:
                 error(sys.exc_info()[0])
 
-        return 0.0001
-        #return 0.06 # 60 FPS update rate
-
-        # return 1.0
-
     def sync_tracked_objects(self, scene, depsgraph):
-        """Add/remove objects from the bridge to match the scene
+        """Add/remove objects from the bridge to match the scene.
+
+        Objects may be added/removed in case of undo, rename, etc.
 
         Parameters:
             scene (bpy.types.Scene)
             depsgraph (bpy.types.Depsgraph)
         """
-        current_ids = set()
-        
+        current = set() # Set of tracked object names
+
         # Check for added objects
         for obj in scene.objects:
             if is_supported_object(obj):
-                uid = get_object_uid(obj)
-                if uid not in self.object_ids:
+                if obj.name not in self.objects:
                     self.on_add_object(obj, depsgraph)
-                
-                current_ids.add(uid)
-                
+
+                current.add(obj.name)
+
         # Check for removed objects
-        removed_ids = self.object_ids - current_ids
-        for uid in removed_ids:
-            self.on_remove_object(uid)
-        
+        removed = self.objects - current
+        for name in removed:
+            self.on_remove_object(name)
+
         # Update current tracked list
-        self.object_ids = current_ids
+        self.objects = current
 
     def on_depsgraph_update(self, scene, depsgraph):
         """Sync the bridge with the scene's dependency graph on each update
-        
+
         Parameters:
             scene (bpy.types.Scene)
             depsgraph (bpy.types.Depsgraph)
         """
         debug('on depsgraph update')
-        
+
         self.sync_tracked_objects(scene, depsgraph)
 
         # Check for updates to objects (geometry changes, transform changes, etc)
@@ -267,87 +314,69 @@ class BridgeDriver:
                     self.on_update_transform(obj)
                 elif update.is_updated_geometry:
                     self.on_update_geometry(obj, depsgraph)
-                
+
                 # A material association can change - which doesn't
-                # trigger a material update but does trigger a 
+                # trigger a material update but does trigger a
                 # depsgraph update on the parent object.
                 self.on_update_object_material(obj)
 
     def on_add_object(self, obj, depsgraph):
         """Notify the bridge that the object has been added to the scene
-        
+
         Parameters:
             obj (bpy.types.Object):             The object that was added to the scene
             depsgraph (bpy.types.Depsgraph):    Dependency graph to use for generating a final mesh
         """
-        uid = get_object_uid(obj)
         mat_name = get_material_unity_name(obj.active_material)
-        
-        debug('on_add_object - name={}, uid={}'.format(obj.name, uid))
+
+        debug('on_add_object - name={}, mat_name={}'.format(obj.name, mat_name))
+
+        # TODO: Other object types
 
         self.lib.AddMeshObjectToScene(
-            uid, 
-            create_string_buffer(obj.name.encode()), 
+            get_string_buffer(obj.name),
             to_interop_matrix4x4(obj.matrix_world),
-            create_string_buffer(mat_name.encode())
+            get_string_buffer(mat_name)
         )
-        
+
         # Send up initial geometry as well
         self.on_update_geometry(obj, depsgraph)
-    
-    def on_remove_object(self, uid):
-        """Notify the bridge that the object has been removed from the scene
-        
-        Parameters:
-            uid (int): Unique Object ID shared with the Bridge
-        """
-        if uid < 0: return
-    
-        debug('on_remove_object - uid={}'.format(uid))
 
-        self.lib.RemoveObjectFromScene(uid)
+    def on_remove_object(self, name):
+        """Notify the bridge that the object has been removed from the scene
+
+        Parameters:
+            name (str): Unique object name shared with the Bridge
+        """
+        debug('on_remove_object - name={}'.format(name))
+
+        self.lib.RemoveObjectFromScene(
+            get_string_buffer(name)
+        )
 
     def on_update_transform(self, obj):
         """Notify the bridge that the object has been transformed in the scene
-        
-        Parameters:
-            obj (bpy.types.Object):             The object that was updated
-        """
-        uid = get_object_uid(obj)
 
-        debug('on_update_transform - name={}, uid={}'.format(obj.name, uid))
+        Parameters:
+            obj (bpy.types.Object): The object that was updated
+        """
+        debug('on_update_transform - name={}'.format(obj.name))
 
         self.lib.SetObjectTransform(
-            uid,
+            get_string_buffer(obj.name),
             to_interop_matrix4x4(obj.matrix_world)
         )
 
-    def on_update_object_material(self, obj):
-        """Pass an object's material reference to the bridge
-        
-        Parameters:
-            obj (bpy.types.Object):             The object that was updated
-        """
-        uid = get_object_uid(obj)
-
-        debug('on_update_object_material - name={}, uid={}'.format(obj.name, uid))
-
-        name = get_material_unity_name(obj.active_material)
-        name_buf = create_string_buffer(name.encode())
-
-        self.lib.SetObjectMaterial(uid, name_buf)
-
     def on_update_geometry(self, obj, depsgraph):
         """Notify the bridge that object geometry has changed
-        
+
         Parameters:
             obj (bpy.types.Object):             The object that was updated
             depsgraph (bpy.types.Depsgraph):    Dependency graph to use for generating a final mesh
         """
-        uid = get_object_uid(obj)
+        debug('on_update_geometry - name={}'.format(obj.name))
 
-        debug('on_update_geometry - name={}, uid={}'.format(obj.name, uid))
-
+        name_buf = get_string_buffer(obj.name)
         eval_obj = obj.evaluated_get(depsgraph)
         mesh = eval_obj.to_mesh()
 
@@ -358,7 +387,7 @@ class BridgeDriver:
         # while loops align with loop_triangles
         debug('on_update_geometry - loops_len={}'.format(len(mesh.loops)))
         self.lib.CopyVertices(
-            uid,
+            name_buf,
             mesh.loops[0].as_pointer(),
             len(mesh.loops),
             mesh.vertices[0].as_pointer(),
@@ -367,13 +396,32 @@ class BridgeDriver:
 
         debug('on_update_geometry - loop_triangles_len={} '.format(len(mesh.loop_triangles)))
         self.lib.CopyLoopTriangles(
-            uid,
+            name_buf,
             mesh.loop_triangles[0].as_pointer(),
             len(mesh.loop_triangles)
         )
 
+        # TODO: UVs?
+
         eval_obj.to_mesh_clear()
-    
+
+    def on_update_object_material(self, obj):
+        """Pass an object's material reference to the bridge
+
+        Parameters:
+            obj (bpy.types.Object):             The object that was updated
+        """
+        debug('on_update_object_material - name={}'.format(obj.name))
+
+        mat_name_buf = get_string_buffer(
+            get_material_unity_name(obj.active_material)
+        )
+
+        self.lib.SetObjectMaterial(
+            get_string_buffer(obj.name),
+            mat_name_buf
+        )
+
     def on_update_material(self, mat):
         """
         Parameters:
@@ -382,13 +430,28 @@ class BridgeDriver:
         """
         debug('on_update_material - name={}'.format(mat.name))
 
-        name = get_material_unity_name(mat)
-        name_buf = create_string_buffer(name.encode())
+        mat_name_buf = get_string_buffer(
+            get_material_unity_name(mat)
+        )
 
         # TODO: This may pass in objects that aren't tracked yet by the bridge.
         # Is that fine? (Probably safe to ignore errors for these)
+        # Could also iterate self.objects here and pull each from bpy.data.objects
         for obj in bpy.context.scene.objects:
             if obj.active_material:
-                uid = get_object_uid(obj)
-                self.lib.SetObjectMaterial(uid, name_buf)
-        
+                self.lib.SetObjectMaterial(
+                    get_string_buffer(obj.name),
+                    mat_name_buf
+                )
+
+
+def bridge_driver() -> BridgeDriver:
+    """Retrieve the active driver singleton
+
+    Returns:
+        BridgeDriver
+    """
+    if 'COHERENCE' not in bpy.app.driver_namespace:
+        bpy.app.driver_namespace['COHERENCE'] = BridgeDriver()
+
+    return bpy.app.driver_namespace['COHERENCE']
